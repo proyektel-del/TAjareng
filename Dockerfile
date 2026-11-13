@@ -1,11 +1,23 @@
 # ==========================================
 # STAGE 1: Build Assets (Node)
 # ==========================================
-FROM node:20-alpine AS node-builder
+FROM node:22-alpine AS node-builder
 WORKDIR /app
+
+# Copy dependency files
 COPY package*.json ./
-RUN npm ci
-COPY . .
+COPY .npmrc* ./
+
+# Install packages with npm install (more tolerant on platform differences than npm ci)
+RUN npm install --ignore-scripts
+
+# Copy source files needed for Vite
+COPY resources ./resources
+COPY vite.config.js ./
+COPY tailwind.config.js ./
+COPY postcss.config.js* ./
+
+# Build assets
 RUN npm run build
 
 # ==========================================
@@ -59,10 +71,10 @@ COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
 
 WORKDIR /var/www
 
-# Copy files
+# Copy application files
 COPY . .
 
-# Copy compiled assets from node-builder stage (no node/npm in final container!)
+# Copy compiled Vite assets from node-builder
 COPY --from=node-builder /app/public/build ./public/build
 
 # Install PHP dependencies optimized for production
