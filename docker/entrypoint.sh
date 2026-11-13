@@ -1,16 +1,13 @@
 #!/bin/sh
 set -e
 
-# Buat folder konfigurasi Nginx jika belum ada
-mkdir -p /etc/nginx/templates
-
-# Buat konfigurasi Nginx dengan port dinamis dari $PORT (default 80)
+# Port target untuk Nginx (default 80)
 TARGET_PORT=${PORT:-80}
 echo "[INFO] Configuring Nginx to listen on port: $TARGET_PORT"
 
 cat <<EOF > /etc/nginx/http.d/default.conf
 server {
-    listen $TARGET_PORT;
+    listen $TARGET_PORT default_server;
     server_name _;
     root /var/www/public;
     index index.php index.html;
@@ -50,12 +47,12 @@ server {
 }
 EOF
 
-# Pastikan folder penting ada dan writable
+# Pastikan folder framework ada dan permission benar
 mkdir -p /var/www/storage/framework/sessions /var/www/storage/framework/views /var/www/storage/framework/cache /var/www/storage/logs
 chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache
 chmod -R 775 /var/www/storage /var/www/bootstrap/cache
 
-# Jika APP_KEY belum diset di environment, generate sementara agar tidak crash 500
+# Cek & fallback APP_KEY
 if [ -z "$APP_KEY" ]; then
     echo "[WARN] APP_KEY is empty. Generating application key..."
     php artisan key:generate --force || true
@@ -65,7 +62,7 @@ fi
 php artisan storage:link || true
 php artisan migrate --force || true
 
-# Bersihkan cache lama lalu buat cache baru yang valid
+# Refresh cache
 php artisan optimize:clear || true
 php artisan config:cache || true
 php artisan route:cache || true
