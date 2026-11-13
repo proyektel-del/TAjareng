@@ -685,7 +685,7 @@
 
                     if (status === 'capturing') {
                         setStatus('capturing', `Mengambil dataset wajah: ${current} / ${total} (${percent}%)`);
-                        captureTimer = setTimeout(sendRegistrationFrameLoop, 80);
+                        captureTimer = setTimeout(sendRegistrationFrameLoop, 120);
                     } else if (status === 'training') {
                         setStatus('training', 'Training Model LBPH sedang berjalan... Harap tunggu.');
                         stopMediaTracks();
@@ -701,11 +701,11 @@
                 } catch (err) {
                     console.error("Frame upload error:", err);
                     setStatus('error', 'Gagal menghubungi server Python.');
-                    captureTimer = setTimeout(sendRegistrationFrameLoop, 500);
+                    captureTimer = setTimeout(sendRegistrationFrameLoop, 600);
                 } finally {
                     isUploadingFrame = false;
                 }
-            }, 'image/jpeg', 0.85);
+            }, 'image/jpeg', 0.75);
             return;
         }
 

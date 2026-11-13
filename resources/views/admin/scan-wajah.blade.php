@@ -941,14 +941,14 @@
                 } finally {
                     isUploadingFrame = false;
                     if (isRunning) {
-                        frameTimer = setTimeout(sendAttendanceFrameLoop, 150);
+                        frameTimer = setTimeout(sendAttendanceFrameLoop, 250);
                     }
                 }
-            }, 'image/jpeg', 0.8);
+            }, 'image/jpeg', 0.7);
             return;
         }
 
-        frameTimer = setTimeout(sendAttendanceFrameLoop, 150);
+        frameTimer = setTimeout(sendAttendanceFrameLoop, 250);
     }
 
     function onFaceRecognized(userData) {
