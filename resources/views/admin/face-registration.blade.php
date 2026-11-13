@@ -327,7 +327,8 @@
                 <div class="corner corner-bl"></div>
                 <div class="corner corner-br"></div>
                 
-                <img id="webcamFeed" style="display:none;" src="" alt="Webcam Feed">
+                <video id="webcamVideo" autoplay playsinline muted style="display:none; width:100%; height:100%; object-fit:cover; transform:scaleX(-1);"></video>
+                <canvas id="overlayCanvas" style="display:none; position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:5;"></canvas>
                 
                 <div class="camera-off" id="cameraOff">
                     <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" fill="none" stroke="#94a3b8" stroke-width="1.5" viewBox="0 0 24 24">
@@ -444,15 +445,22 @@
 
 <script>
     let pollInterval = null;
+    let captureTimer = null;
+    let mediaStream = null;
+    let isUploadingFrame = false;
     let selectedUserId = null;
     let selectedUserName = "";
-    const pythonHost = "http://localhost:5000";
+    const pythonHost = "{{ config('services.python_face.url') }}";
 
     const userSelect        = document.getElementById('userSelect');
     const userSearchInput   = document.getElementById('userSearchInput');
     const btnStart          = document.getElementById('btnStart');
     const btnStop           = document.getElementById('btnStop');
-    const webcamFeed        = document.getElementById('webcamFeed');
+    const webcamVideo       = document.getElementById('webcamVideo');
+    const overlayCanvas     = document.getElementById('overlayCanvas');
+    const overlayCtx        = overlayCanvas.getContext('2d');
+    const captureCanvas     = document.createElement('canvas');
+    const captureCtx        = captureCanvas.getContext('2d');
     const cameraOff         = document.getElementById('cameraOff');
     const statusBar         = document.getElementById('statusBar');
     const statusText        = document.getElementById('statusText');
@@ -555,32 +563,153 @@
         hideDropdownList();
     }
 
-    function startRegistration() {
+    function stopMediaTracks() {
+        if (captureTimer) {
+            clearTimeout(captureTimer);
+            captureTimer = null;
+        }
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(track => track.stop());
+            mediaStream = null;
+        }
+        webcamVideo.srcObject = null;
+        webcamVideo.style.display = 'none';
+        overlayCanvas.style.display = 'none';
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        cameraOff.style.display = 'flex';
+        isUploadingFrame = false;
+    }
+
+    function drawFaceOverlay(box, color, label) {
+        if (!webcamVideo.videoWidth || !webcamVideo.videoHeight) return;
+        if (overlayCanvas.width !== webcamVideo.videoWidth || overlayCanvas.height !== webcamVideo.videoHeight) {
+            overlayCanvas.width = webcamVideo.videoWidth;
+            overlayCanvas.height = webcamVideo.videoHeight;
+        }
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+        if (box) {
+            const [x, y, w, h] = box;
+            overlayCtx.strokeStyle = color;
+            overlayCtx.lineWidth = 3;
+            overlayCtx.strokeRect(x, y, w, h);
+        }
+        if (label) {
+            overlayCtx.font = 'bold 16px sans-serif';
+            overlayCtx.fillStyle = color;
+            overlayCtx.fillText(label, 16, 32);
+        }
+    }
+
+    async function startRegistration() {
         if (!selectedUserId) return;
 
-        // Reset state di Flask untuk user ini
-        fetch(`${pythonHost}/reset/${selectedUserId}`, { method: 'POST' })
-            .then(() => {
-                // Aktifkan streaming MJPEG ke element img
-                webcamFeed.src = `${pythonHost}/register-feed/${selectedUserId}`;
-                webcamFeed.style.display = 'block';
-                cameraOff.style.display = 'none';
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            setStatus('error', 'Browser tidak mendukung akses kamera (pastikan menggunakan HTTPS atau localhost).');
+            return;
+        }
 
-                userSearchInput.disabled = true;
-                btnStart.disabled = true;
-                btnStop.disabled = false;
-                progressContainer.style.display = 'block';
-                progressBar.style.width = "0%";
-
-                setStatus('capturing', 'Mengaktifkan webcam, memproses deteksi...');
-
-                // Mulai polling status registrasi
-                startPolling();
-            })
-            .catch(err => {
-                setStatus('error', 'Gagal menghubungi server Python. Jalankan flask API di port 5000.');
-                console.error(err);
+        try {
+            setStatus('capturing', 'Meminta izin akses kamera browser...');
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+                video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+                audio: false
             });
+
+            await fetch(`${pythonHost}/reset/${selectedUserId}`, { method: 'POST' });
+
+            webcamVideo.srcObject = mediaStream;
+            await webcamVideo.play();
+
+            webcamVideo.style.display = 'block';
+            overlayCanvas.style.display = 'block';
+            cameraOff.style.display = 'none';
+
+            userSearchInput.disabled = true;
+            btnStart.disabled = true;
+            btnStop.disabled = false;
+            progressContainer.style.display = 'block';
+            progressBar.style.width = "0%";
+
+            setStatus('capturing', 'Kamera aktif, memproses deteksi wajah...');
+            sendRegistrationFrameLoop();
+        } catch (err) {
+            stopMediaTracks();
+            setStatus('error', 'Gagal mengakses kamera atau server Python: ' + err.message);
+            console.error(err);
+        }
+    }
+
+    function sendRegistrationFrameLoop() {
+        if (!mediaStream || !selectedUserId) return;
+
+        if (!isUploadingFrame && webcamVideo.readyState >= 2 && webcamVideo.videoWidth > 0) {
+            isUploadingFrame = true;
+            captureCanvas.width = webcamVideo.videoWidth;
+            captureCanvas.height = webcamVideo.videoHeight;
+
+            // Mirror frame agar sesuai tampilan video di layar
+            captureCtx.save();
+            captureCtx.translate(captureCanvas.width, 0);
+            captureCtx.scale(-1, 1);
+            captureCtx.drawImage(webcamVideo, 0, 0, captureCanvas.width, captureCanvas.height);
+            captureCtx.restore();
+
+            captureCanvas.toBlob(async (blob) => {
+                if (!blob || !mediaStream || !selectedUserId) {
+                    isUploadingFrame = false;
+                    return;
+                }
+
+                try {
+                    const formData = new FormData();
+                    formData.append('image', blob, 'frame.jpg');
+
+                    const res = await fetch(`${pythonHost}/api/register-frame/${selectedUserId}`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+
+                    const status = data.status;
+                    const current = data.current || 0;
+                    const total = data.total || 100;
+                    const percent = Math.round((current / total) * 100);
+
+                    progressBar.style.width = percent + "%";
+                    drawFaceOverlay(
+                        data.box,
+                        data.face_detected ? '#10b981' : '#3b82f6',
+                        data.face_detected ? `Sampel: ${current}/${total}` : 'Posisikan wajah Anda di depan kamera'
+                    );
+
+                    if (status === 'capturing') {
+                        setStatus('capturing', `Mengambil dataset wajah: ${current} / ${total} (${percent}%)`);
+                        captureTimer = setTimeout(sendRegistrationFrameLoop, 80);
+                    } else if (status === 'training') {
+                        setStatus('training', 'Training Model LBPH sedang berjalan... Harap tunggu.');
+                        stopMediaTracks();
+                        startPolling();
+                    } else if (status === 'completed') {
+                        setStatus('success', '✓ Capture Selesai & Model Berhasil Dilatih!');
+                        stopMediaTracks();
+                        saveToLaravel(selectedUserId, current);
+                    } else if (status === 'failed') {
+                        setStatus('error', `✗ Gagal: ${data.message || 'Terjadi kesalahan'}`);
+                        stopRegistration();
+                    }
+                } catch (err) {
+                    console.error("Frame upload error:", err);
+                    setStatus('error', 'Gagal menghubungi server Python.');
+                    captureTimer = setTimeout(sendRegistrationFrameLoop, 500);
+                } finally {
+                    isUploadingFrame = false;
+                }
+            }, 'image/jpeg', 0.85);
+            return;
+        }
+
+        captureTimer = setTimeout(sendRegistrationFrameLoop, 100);
     }
 
     function stopRegistration() {
@@ -590,10 +719,7 @@
             pollInterval = null;
         }
 
-        // Matikan image stream
-        webcamFeed.src = "";
-        webcamFeed.style.display = 'none';
-        cameraOff.style.display = 'flex';
+        stopMediaTracks();
 
         userSearchInput.disabled = false;
         userSearchInput.value = "";

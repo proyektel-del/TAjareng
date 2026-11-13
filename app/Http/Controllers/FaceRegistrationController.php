@@ -10,8 +10,10 @@ use Illuminate\Support\Facades\Http;
 
 class FaceRegistrationController extends Controller
 {
-    // Base URL Python service
-    private $pythonHost = 'http://localhost:5000';
+    private function pythonHost(): string
+    {
+        return config('services.python_face.url', 'http://127.0.0.1:5000');
+    }
     public function index()
     {
         // Ambil semua user dengan role siswa yang BELUM registrasi wajah untuk dropdown select
@@ -63,7 +65,7 @@ class FaceRegistrationController extends Controller
 
         // 2. Reset status capture di Python service
         try {
-            Http::timeout(5)->post($this->pythonHost . '/reset/' . $userId);
+            Http::timeout(5)->post($this->pythonHost() . '/reset/' . $userId);
         } catch (\Exception $e) {
             // Python service mungkin tidak jalan, lanjutkan saja
         }
@@ -73,7 +75,7 @@ class FaceRegistrationController extends Controller
 
         // 4. Re-train model agar user yang dihapus tidak lagi dikenali saat scan
         try {
-            Http::timeout(30)->post($this->pythonHost . '/train');
+            Http::timeout(30)->post($this->pythonHost() . '/train');
         } catch (\Exception $e) {
             // Jika retrain gagal, beri warning tapi tetap lanjut
             return redirect()->route('face-registration.index')

@@ -1,491 +1,409 @@
+import base64
 import os
-import cv2
-import time
 import shutil
 import threading
-from flask import Flask, Response, jsonify, request
+import time
+
+import cv2
+import numpy as np
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from train import train_model
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASET_ROOT = os.path.join(BASE_DIR, "dataset")
+TRAINER_DIR = os.path.join(BASE_DIR, "trainer")
+TRAINER_PATH = os.path.join(TRAINER_DIR, "trainer.yml")
+
 app = Flask(__name__)
-# Izinkan CORS agar frontend Laravel bisa fetch API ini dari port yang berbeda
-CORS(app)
+
+# Konfigurasi CORS: di production bisa dibatasi via env CORS_ORIGINS (pisah koma)
+cors_origins_raw = os.getenv("CORS_ORIGINS", "*").strip()
+cors_origins = "*" if cors_origins_raw == "*" else [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+CORS(app, resources={r"/*": {"origins": cors_origins}})
 
 # Global status tracker untuk proses registrasi
 # Format: { user_id: { 'status': 'idle'|'capturing'|'training'|'completed'|'failed', 'current': 0, 'total': 100, 'message': '' } }
 captures_status = {}
-camera_lock = threading.Lock()
+status_lock = threading.Lock()
+model_lock = threading.Lock()
 
-@app.route('/')
+# Load Haar Cascade sekali saat startup agar cepat
+FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+# Recognizer global untuk attendance
+recognizer = None
+has_model = False
+
+
+def load_recognizer():
+    global recognizer, has_model
+    with model_lock:
+        try:
+            rec = cv2.face.LBPHFaceRecognizer_create()
+        except AttributeError:
+            print("[ERROR] cv2.face tidak ditemukan. Pastikan opencv-contrib-python terinstall.")
+            recognizer = None
+            has_model = False
+            return False
+
+        if os.path.exists(TRAINER_PATH):
+            try:
+                rec.read(TRAINER_PATH)
+                recognizer = rec
+                has_model = True
+                print("[INFO] Model trainer.yml berhasil dimuat.")
+                return True
+            except Exception as e:
+                print(f"[ERROR] Gagal membaca model: {str(e)}")
+        else:
+            print("[WARNING] trainer.yml tidak ditemukan. Lakukan registrasi wajah terlebih dahulu.")
+
+        recognizer = rec
+        has_model = False
+        return False
+
+
+load_recognizer()
+
+
+def decode_uploaded_frame():
+    """Decode gambar dari multipart form-data ('image') atau JSON base64 ('image')."""
+    raw_bytes = None
+    if "image" in request.files:
+        raw_bytes = request.files["image"].read()
+    else:
+        payload = request.get_json(silent=True) or {}
+        image_data = payload.get("image")
+        if isinstance(image_data, str) and image_data:
+            if "," in image_data:
+                image_data = image_data.split(",", 1)[1]
+            raw_bytes = base64.b64decode(image_data)
+
+    if not raw_bytes:
+        return None
+
+    np_arr = np.frombuffer(raw_bytes, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    return frame
+
+
+def preprocess_face(gray, x, y, w, h, apply_clahe=False):
+    """Pangkas 10% bagian atas wajah (rambut/dahi) lalu resize ke 200x200."""
+    hair_offset = int(h * 0.10)
+    y_cropped = min(y + hair_offset, y + h - 1)
+    h_cropped = max(1, h - hair_offset)
+    face_crop = gray[y_cropped : y_cropped + h_cropped, x : x + w]
+    face_resized = cv2.resize(face_crop, (200, 200))
+    if apply_clahe:
+        face_resized = clahe.apply(face_resized)
+    return face_resized
+
+
+def run_training_async(user_id):
+    try:
+        train_res = train_model(dataset_dir=DATASET_ROOT, trainer_dir=TRAINER_DIR, model_name="trainer.yml")
+        if train_res.get("success"):
+            load_recognizer()
+            with status_lock:
+                if user_id in captures_status:
+                    captures_status[user_id]["status"] = "completed"
+                    captures_status[user_id]["message"] = "Registrasi wajah dan training selesai!"
+        else:
+            with status_lock:
+                if user_id in captures_status:
+                    captures_status[user_id]["status"] = "failed"
+                    captures_status[user_id]["message"] = f"Training gagal: {train_res.get('message', 'Unknown error')}"
+    except Exception as e:
+        with status_lock:
+            if user_id in captures_status:
+                captures_status[user_id]["status"] = "failed"
+                captures_status[user_id]["message"] = f"Error training: {str(e)}"
+
+
+@app.route("/")
 def index():
     return jsonify({
         "status": "online",
+        "mode": "browser-frame-api",
+        "has_model": has_model,
         "message": "Python Face Recognition Service is running"
     })
 
-def generate_face_samples(user_id, total_samples=100):
-    global captures_status
-    
-    # Buat atau bersihkan folder dataset untuk user ini
-    dataset_dir = os.path.join("dataset", str(user_id))
-    if os.path.exists(dataset_dir):
-        shutil.rmtree(dataset_dir)
-    os.makedirs(dataset_dir)
 
-    captures_status[user_id] = {
-        'status': 'capturing',
-        'current': 0,
-        'total': total_samples,
-        'message': 'Membuka kamera...'
-    }
+@app.route("/api/register-frame/<int:user_id>", methods=["POST"])
+def register_frame(user_id):
+    total_samples = 100
+    frame = decode_uploaded_frame()
+    if frame is None:
+        return jsonify({"success": False, "message": "Frame gambar tidak valid."}), 400
 
-    # Buka webcam
-    camera = cv2.VideoCapture(0, cv2.CAP_DSHOW) # Menggunakan CAP_DSHOW untuk Windows agar lebih cepat
-    if not camera.isOpened():
-        # Coba buka tanpa CAP_DSHOW jika gagal
-        camera = cv2.VideoCapture(0)
-        
-    if not camera.isOpened():
-        captures_status[user_id] = {
-            'status': 'failed',
-            'current': 0,
-            'total': total_samples,
-            'message': 'Gagal mengakses webcam.'
-        }
-        print(f"[ERROR] Gagal membuka kamera untuk user {user_id}")
-        return
+    dataset_dir = os.path.join(DATASET_ROOT, str(user_id))
 
-    # Set resolusi 640x480 untuk mengoptimalkan performa & CPU usage
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    with status_lock:
+        current_state = captures_status.get(user_id)
+        if not current_state or current_state.get("status") in ("idle", "failed", "completed"):
+            if os.path.exists(dataset_dir):
+                shutil.rmtree(dataset_dir)
+            os.makedirs(dataset_dir, exist_ok=True)
+            captures_status[user_id] = {
+                "status": "capturing",
+                "current": 0,
+                "total": total_samples,
+                "message": "Mengambil sampel wajah..."
+            }
+        elif current_state.get("status") == "training":
+            return jsonify({**current_state, "face_detected": False, "box": None})
 
-    # Load Haar Cascade
-    face_cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    face_cascade = cv2.CascadeClassifier(face_cascade_path)
-    
-    count = 0
-    last_capture_time = 0
-    capture_interval = 0.08 # minimal delay 80ms antar capture agar dataset bervariasi
-
-    try:
-        while count < total_samples:
-            # Check status jika direset atau dihentikan di tengah jalan
-            if user_id in captures_status and captures_status[user_id]['status'] in ['failed', 'idle']:
-                break
-                
-            success, frame = camera.read()
-            if not success:
-                break
-
-            # Mirror frame agar natural bagi user
-            frame = cv2.flip(frame, 1)
-            
-            # Deteksi wajah menggunakan grayscale
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.3, 
-                minNeighbors=5, 
-                minSize=(120, 120)
-            )
-
-            # Sortir wajah berdasarkan ukuran terbesar (mengurangi noise latar belakang)
-            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-
-            current_time = time.time()
-            face_detected = len(faces) > 0
-
-            if face_detected:
-                x, y, w, h = faces[0]
-                
-                # Gambar box hijau di wajah
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (16, 185, 129), 2) # Emerald Green (#10b981)
-                
-                # Ambil sampel wajah jika interval waktu terpenuhi
-                if current_time - last_capture_time >= capture_interval:
-                    count += 1
-                    
-                    # Pangkas 10% bagian atas wajah (area rambut/dahi)
-                    # PENTING: harus sama dengan preprocessing saat recognition
-                    hair_offset = int(h * 0.10)
-                    y_cropped = min(y + hair_offset, y + h - 1)
-                    h_cropped = h - hair_offset
-                    
-                    # Crop wajah (dengan hair offset)
-                    face_crop = gray[y_cropped:y_cropped+h_cropped, x:x+w]
-                    # Resize wajah agar konsisten 200x200
-                    face_resized = cv2.resize(face_crop, (200, 200))
-                    
-                    # Simpan gambar
-                    img_path = os.path.join(dataset_dir, f"user_{user_id}_{count}.jpg")
-                    cv2.imwrite(img_path, face_resized)
-                    
-                    last_capture_time = current_time
-                    captures_status[user_id]['current'] = count
-                    captures_status[user_id]['message'] = f"Mengambil sampel wajah: {count}/{total_samples}"
-
-                # Overlay status
-                cv2.putText(
-                    frame, 
-                    f"Sampel: {count}/{total_samples}", 
-                    (20, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.7, 
-                    (16, 185, 129), 
-                    2
-                )
-            else:
-                # Tulis instruksi jika tidak ada wajah
-                cv2.putText(
-                    frame, 
-                    "Posisikan wajah Anda di depan kamera", 
-                    (20, 40), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.6, 
-                    (59, 130, 246), 
-                    2
-                )
-
-            # Encode frame ke JPEG untuk streaming
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_bytes = buffer.tobytes()
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            
-            # Sleep sedikit untuk mengurangi beban CPU (capping frame rate ke ~30 FPS)
-            time.sleep(0.03)
-
-        # Proses training setelah capture selesai
-        if count >= total_samples:
-            captures_status[user_id]['status'] = 'training'
-            captures_status[user_id]['message'] = 'Melakukan training model wajah (LBPH)...'
-            
-            # Panggil fungsi training
-            train_res = train_model()
-            
-            if train_res["success"]:
-                captures_status[user_id]['status'] = 'completed'
-                captures_status[user_id]['message'] = 'Registrasi wajah dan training selesai!'
-            else:
-                captures_status[user_id]['status'] = 'failed'
-                captures_status[user_id]['message'] = f'Training gagal: {train_res["message"]}'
-        else:
-            if captures_status[user_id]['status'] != 'failed':
-                captures_status[user_id]['status'] = 'failed'
-                captures_status[user_id]['message'] = 'Proses pengambilan sampel terputus.'
-
-    except Exception as e:
-        print(f"[ERROR] Exception terjadi saat capture: {str(e)}")
-        captures_status[user_id] = {
-            'status': 'failed',
-            'current': count,
-            'total': total_samples,
-            'message': f'Error: {str(e)}'
-        }
-    finally:
-        camera.release()
-        print(f"[INFO] Kamera dilepas untuk user {user_id}")
-
-@app.route('/register-feed/<int:user_id>')
-def register_feed(user_id):
-    # Coba lock kamera agar tidak tabrakan
-    acquired = camera_lock.acquire(blocking=False)
-    if not acquired:
-        return Response(
-            "Kamera sedang digunakan oleh sesi lain. Harap tunggu.", 
-            status=409, 
-            mimetype='text/plain'
-        )
-        
-    def stream_wrapper():
-        try:
-            yield from generate_face_samples(user_id)
-        finally:
-            camera_lock.release()
-            
-    return Response(
-        stream_wrapper(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.3,
+        minNeighbors=5,
+        minSize=(120, 120),
     )
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
 
-@app.route('/status/<int:user_id>')
-def get_status(user_id):
-    status = captures_status.get(user_id, {
-        'status': 'idle',
-        'current': 0,
-        'total': 100,
-        'message': 'Belum memulai.'
+    face_detected = len(faces) > 0
+    box = None
+
+    if face_detected:
+        x, y, w, h = [int(v) for v in faces[0]]
+        box = [x, y, w, h]
+        face_resized = preprocess_face(gray, x, y, w, h, apply_clahe=False)
+
+        should_train = False
+        with status_lock:
+            state = captures_status[user_id]
+            if state["status"] == "capturing" and state["current"] < total_samples:
+                state["current"] += 1
+                count = state["current"]
+                img_path = os.path.join(dataset_dir, f"user_{user_id}_{count}.jpg")
+                cv2.imwrite(img_path, face_resized)
+                state["message"] = f"Mengambil sampel wajah: {count}/{total_samples}"
+
+                if count >= total_samples:
+                    state["status"] = "training"
+                    state["message"] = "Melakukan training model wajah (LBPH)..."
+                    should_train = True
+
+        if should_train:
+            threading.Thread(target=run_training_async, args=(user_id,), daemon=True).start()
+
+    with status_lock:
+        response_state = dict(captures_status[user_id])
+
+    return jsonify({
+        **response_state,
+        "face_detected": face_detected,
+        "box": box,
     })
+
+
+@app.route("/status/<int:user_id>")
+def get_status(user_id):
+    with status_lock:
+        status = captures_status.get(
+            user_id,
+            {
+                "status": "idle",
+                "current": 0,
+                "total": 100,
+                "message": "Belum memulai.",
+            },
+        )
     return jsonify(status)
 
-@app.route('/reset/<int:user_id>', methods=['POST'])
+
+@app.route("/reset/<int:user_id>", methods=["POST"])
 def reset_status(user_id):
-    global captures_status
-    if user_id in captures_status:
+    with status_lock:
         captures_status[user_id] = {
-            'status': 'idle',
-            'current': 0,
-            'total': 100,
-            'message': 'State direset.'
+            "status": "idle",
+            "current": 0,
+            "total": 100,
+            "message": "State direset.",
         }
     return jsonify({"success": True, "message": f"Status untuk user {user_id} telah direset"})
 
-@app.route('/train', methods=['POST'])
+
+@app.route("/train", methods=["POST"])
 def manual_train():
-    res = train_model()
+    res = train_model(dataset_dir=DATASET_ROOT, trainer_dir=TRAINER_DIR, model_name="trainer.yml")
+    if res.get("success"):
+        load_recognizer()
     return jsonify(res)
+
 
 # ==========================================
 # ABSENSI SCAN WAJAH (RECOGNITION)
 # ==========================================
-last_attendance_recognition = {"user_id": None, "confidence": 0.0, "timestamp": 0}
-recognition_locked = False  # Flag: True jika data sudah dibaca dan sedang diproses oleh frontend
+REQUIRED_VOTES = 7
+MAX_AVG_CONFIDENCE = 40.0
+MAX_FRAME_CONFIDENCE = 45.0
 
-# Multi-frame voting: kumpulkan beberapa frame sebelum trigger absensi
-# Menghindari false positive dari 1 frame yang kebetulan cocok
-recognition_vote = {"user_id": None, "count": 0, "confidences": []}
-REQUIRED_VOTES = 7  # Butuh 7 frame berurutan dengan ID yang sama (lebih ketat)
-MAX_AVG_CONFIDENCE = 40.0  # Rata-rata confidence semua vote harus di bawah ini
+attendance_sessions = {}
+attendance_lock = threading.Lock()
 
-def generate_attendance_frames():
-    global last_attendance_recognition, recognition_locked, recognition_vote
-    
-    # Buka webcam
-    camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if not camera.isOpened():
-        camera = cv2.VideoCapture(0)
-        
-    if not camera.isOpened():
-        print("[ERROR] Gagal membuka kamera untuk absensi")
-        return
 
-    # Set resolusi 640x480 untuk mengoptimalkan performa & CPU usage
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    # Inisialisasi recognizer dan load model
-    try:
-        recognizer = cv2.face.LBPHFaceRecognizer_create()
-    except AttributeError:
-        print("[ERROR] cv2.face tidak ditemukan.")
-        return
-        
-    trainer_path = os.path.join("trainer", "trainer.yml")
-    has_model = False
-    
-    if os.path.exists(trainer_path):
-        try:
-            recognizer.read(trainer_path)
-            has_model = True
-            print("[INFO] Model trainer.yml berhasil dimuat.")
-        except Exception as e:
-            print(f"[ERROR] Gagal membaca model: {str(e)}")
-    else:
-        print("[WARNING] trainer.yml tidak ditemukan. Lakukan registrasi wajah terlebih dahulu.")
-
-    # Load Haar Cascade
-    face_cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-    face_cascade = cv2.CascadeClassifier(face_cascade_path)
-
-    try:
-        while True:
-            success, frame = camera.read()
-            if not success:
-                break
-                
-            frame = cv2.flip(frame, 1)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Deteksi wajah (minSize lebih besar untuk mengurangi noise dari wajah kecil/jauh)
-            faces = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.3, 
-                minNeighbors=5, 
-                minSize=(150, 150)
-            )
-            
-            # Sortir wajah berdasarkan ukuran terbesar
-            faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-            
-            if len(faces) > 0 and has_model:
-                x, y, w, h = faces[0]
-                
-                # Pangkas 10% bagian atas wajah (area rambut/dahi)
-                # agar model lebih fokus ke fitur wajah inti: mata, hidung, mulut
-                hair_offset = int(h * 0.10)
-                y_cropped = min(y + hair_offset, y + h - 1)
-                h_cropped  = h - hair_offset
-                
-                # Crop dan resize area wajah (tanpa rambut)
-                face_crop = gray[y_cropped:y_cropped+h_cropped, x:x+w]
-                face_resized = cv2.resize(face_crop, (200, 200))
-                
-                # CLAHE: normalisasi kontras cahaya (HARUS sama dengan preprocessing training)
-                # Membantu ketika pencahayaan ruangan berbeda dengan saat registrasi
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                face_resized = clahe.apply(face_resized)
-                
-                # Lakukan prediksi
-                label_id, confidence = recognizer.predict(face_resized)
-                
-                # Threshold diperketat: 45.0 (dari 55.0)
-                # LBPH: semakin kecil nilai confidence = semakin mirip
-                # 0-30 = sangat mirip, 30-40 = mirip, 40-45 = cukup mirip, >45 = bukan orang yg sama
-                if confidence < 45.0:
-                    # Gambar box hijau
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (16, 185, 129), 2)
-                    
-                    # Multi-frame voting: pastikan ID yang sama muncul REQUIRED_VOTES kali berurutan
-                    if not recognition_locked:
-                        if recognition_vote["user_id"] == int(label_id):
-                            recognition_vote["count"] += 1
-                            recognition_vote["confidences"].append(float(confidence))
-                        else:
-                            # ID berbeda dari sebelumnya — reset voting
-                            recognition_vote["user_id"] = int(label_id)
-                            recognition_vote["count"] = 1
-                            recognition_vote["confidences"] = [float(confidence)]
-                        
-                        if recognition_vote["count"] >= REQUIRED_VOTES:
-                            # Cek rata-rata confidence dari semua vote
-                            avg_conf = sum(recognition_vote["confidences"]) / len(recognition_vote["confidences"])
-                            
-                            if avg_conf < MAX_AVG_CONFIDENCE:
-                                # Sudah terkonfirmasi N frame berurutan dengan confidence bagus — trigger absensi
-                                last_attendance_recognition = {
-                                    "user_id": int(label_id),
-                                    "confidence": float(avg_conf),
-                                    "timestamp": time.time()
-                                }
-                                recognition_locked = True  # Kunci sampai frontend selesai proses
-                                recognition_vote = {"user_id": None, "count": 0, "confidences": []}  # Reset voting
-                                print(f"[ABSENSI] User {label_id} terdeteksi, avg confidence: {avg_conf:.1f}")
-                            else:
-                                # Confidence rata-rata terlalu tinggi — kemungkinan bukan orang yang benar
-                                print(f"[REJECT] User {label_id} ditolak, avg confidence: {avg_conf:.1f} > {MAX_AVG_CONFIDENCE}")
-                                recognition_vote = {"user_id": None, "count": 0, "confidences": []}  # Reset voting
-                    
-                    # Tampilkan info di frame
-                    avg_display = 0.0
-                    if recognition_vote["confidences"]:
-                        avg_display = sum(recognition_vote["confidences"]) / len(recognition_vote["confidences"])
-                    label_txt = f"ID:{label_id} ({round(confidence,1)}) [{recognition_vote['count']}/{REQUIRED_VOTES}]"
-                    cv2.putText(
-                        frame, 
-                        label_txt, 
-                        (x, y - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.55, 
-                        (16, 185, 129), 
-                        2
-                    )
-                else:
-                    # Gambar box merah untuk tidak dikenal
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (239, 68, 68), 2)
-                    cv2.putText(
-                        frame, 
-                        "Tidak Dikenal", 
-                        (x, y - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.6, 
-                        (239, 68, 68), 
-                        2
-                    )
-            else:
-                # Tidak ada wajah terdeteksi di frame ini — reset voting counter
-                # Ini mencegah akumulasi vote dari frame terpisah yang tidak berurutan
-                if recognition_vote["count"] > 0:
-                    recognition_vote = {"user_id": None, "count": 0, "confidences": []}
-            
-            if len(faces) > 0 and not has_model:
-                # Wajah ada tapi model tidak ada
-                x, y, w, h = faces[0]
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (245, 158, 11), 2)
-                cv2.putText(
-                    frame, 
-                    "Model Belum Ditraining", 
-                    (x, y - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 
-                    0.5, 
-                    (245, 158, 11), 
-                    2
-                )
-            
-            # Tambahkan status info model pada frame
-            status_txt = "Model: OK" if has_model else "Model: MISSING"
-            color = (16, 185, 129) if has_model else (239, 68, 68)
-            cv2.putText(
-                frame, 
-                status_txt, 
-                (20, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 
-                0.5, 
-                color, 
-                2
-            )
-
-            # Encode frame
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_bytes = buffer.tobytes()
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                   
-            time.sleep(0.03) # Sekitar 30fps
-
-    except Exception as e:
-        print(f"[ERROR] Exception saat scan absensi: {str(e)}")
-    finally:
-        camera.release()
-        print("[INFO] Kamera absensi dilepas.")
-
-@app.route('/attendance-feed')
-def attendance_feed():
-    acquired = camera_lock.acquire(blocking=False)
-    if not acquired:
-        return Response(
-            "Kamera sedang digunakan oleh sesi lain. Harap tunggu.", 
-            status=409, 
-            mimetype='text/plain'
-        )
-        
-    def stream_wrapper():
-        try:
-            yield from generate_attendance_frames()
-        finally:
-            camera_lock.release()
-            
-    return Response(
-        stream_wrapper(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
-
-@app.route('/attendance-status')
-def get_attendance_status():
-    global last_attendance_recognition
-    now = time.time()
-    if last_attendance_recognition["user_id"] is not None and (now - last_attendance_recognition["timestamp"] < 3.0):
-        data = {
-            "user_id": last_attendance_recognition["user_id"],
-            "confidence": last_attendance_recognition["confidence"]
+def get_session_state(session_id):
+    if session_id not in attendance_sessions:
+        attendance_sessions[session_id] = {
+            "locked": False,
+            "vote": {"user_id": None, "count": 0, "confidences": []},
+            "last_recognition": {"user_id": None, "confidence": 0.0, "timestamp": 0},
         }
-        # Jangan reset di sini — reset dilakukan setelah frontend selesai proses (via /attendance-unlock)
-        return jsonify(data)
-        
+    return attendance_sessions[session_id]
+
+
+@app.route("/api/attendance-frame", methods=["POST"])
+def attendance_frame():
+    frame = decode_uploaded_frame()
+    if frame is None:
+        return jsonify({"success": False, "message": "Frame gambar tidak valid."}), 400
+
+    session_id = request.form.get("session_id") or (request.get_json(silent=True) or {}).get("session_id") or "default"
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.3,
+        minNeighbors=5,
+        minSize=(150, 150),
+    )
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+
+    if len(faces) == 0:
+        with attendance_lock:
+            state = get_session_state(session_id)
+            if state["vote"]["count"] > 0:
+                state["vote"] = {"user_id": None, "count": 0, "confidences": []}
+        return jsonify({
+            "has_model": has_model,
+            "face_detected": False,
+            "box": None,
+            "recognized": False,
+            "user_id": None,
+            "confidence": None,
+            "vote_count": 0,
+            "required_votes": REQUIRED_VOTES,
+            "label": "Tidak ada wajah",
+        })
+
+    x, y, w, h = [int(v) for v in faces[0]]
+    box = [x, y, w, h]
+
+    if not has_model or recognizer is None:
+        return jsonify({
+            "has_model": False,
+            "face_detected": True,
+            "box": box,
+            "recognized": False,
+            "user_id": None,
+            "confidence": None,
+            "vote_count": 0,
+            "required_votes": REQUIRED_VOTES,
+            "label": "Model Belum Ditraining",
+        })
+
+    face_resized = preprocess_face(gray, x, y, w, h, apply_clahe=True)
+    with model_lock:
+        label_id, confidence = recognizer.predict(face_resized)
+
+    recognized_user_id = None
+    recognized_conf = None
+    vote_count = 0
+    is_match = float(confidence) < MAX_FRAME_CONFIDENCE
+    label_txt = "Tidak Dikenal"
+
+    with attendance_lock:
+        state = get_session_state(session_id)
+        if is_match:
+            if not state["locked"]:
+                if state["vote"]["user_id"] == int(label_id):
+                    state["vote"]["count"] += 1
+                    state["vote"]["confidences"].append(float(confidence))
+                else:
+                    state["vote"] = {
+                        "user_id": int(label_id),
+                        "count": 1,
+                        "confidences": [float(confidence)],
+                    }
+
+                vote_count = state["vote"]["count"]
+                label_txt = f"ID:{label_id} ({round(confidence, 1)}) [{vote_count}/{REQUIRED_VOTES}]"
+
+                if state["vote"]["count"] >= REQUIRED_VOTES:
+                    avg_conf = sum(state["vote"]["confidences"]) / len(state["vote"]["confidences"])
+                    if avg_conf < MAX_AVG_CONFIDENCE:
+                        state["last_recognition"] = {
+                            "user_id": int(label_id),
+                            "confidence": float(avg_conf),
+                            "timestamp": time.time(),
+                        }
+                        state["locked"] = True
+                        state["vote"] = {"user_id": None, "count": 0, "confidences": []}
+                        recognized_user_id = int(label_id)
+                        recognized_conf = float(avg_conf)
+                        print(f"[ABSENSI] User {label_id} terdeteksi, avg confidence: {avg_conf:.1f}")
+                    else:
+                        print(f"[REJECT] User {label_id} ditolak, avg confidence: {avg_conf:.1f} > {MAX_AVG_CONFIDENCE}")
+                        state["vote"] = {"user_id": None, "count": 0, "confidences": []}
+            else:
+                label_txt = f"ID:{label_id} (Memproses...)"
+        else:
+            if state["vote"]["count"] > 0:
+                state["vote"] = {"user_id": None, "count": 0, "confidences": []}
+
+    return jsonify({
+        "has_model": True,
+        "face_detected": True,
+        "box": box,
+        "recognized": recognized_user_id is not None,
+        "user_id": recognized_user_id,
+        "confidence": recognized_conf,
+        "is_match": is_match,
+        "vote_count": vote_count,
+        "required_votes": REQUIRED_VOTES,
+        "label": label_txt,
+    })
+
+
+@app.route("/attendance-status")
+def get_attendance_status():
+    session_id = request.args.get("session_id", "default")
+    now = time.time()
+    with attendance_lock:
+        state = get_session_state(session_id)
+        last = state["last_recognition"]
+        if last["user_id"] is not None and (now - last["timestamp"] < 3.0):
+            return jsonify({
+                "user_id": last["user_id"],
+                "confidence": last["confidence"],
+            })
     return jsonify({"user_id": None})
 
-@app.route('/attendance-unlock', methods=['POST'])
+
+@app.route("/attendance-unlock", methods=["POST"])
 def attendance_unlock():
-    """Dipanggil oleh frontend setelah absensi selesai diproses.
-    Mereset data pengenalan wajah dan membuka kunci agar wajah baru bisa dideteksi.
-    """
-    global last_attendance_recognition, recognition_locked, recognition_vote
-    last_attendance_recognition = {"user_id": None, "confidence": 0.0, "timestamp": 0}
-    recognition_locked = False
-    recognition_vote = {"user_id": None, "count": 0, "confidences": []}  # Reset voting saat unlock
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id", "default")
+    with attendance_lock:
+        state = get_session_state(session_id)
+        state["last_recognition"] = {"user_id": None, "confidence": 0.0, "timestamp": 0}
+        state["locked"] = False
+        state["vote"] = {"user_id": None, "count": 0, "confidences": []}
     return jsonify({"success": True, "message": "Recognition lock dilepas"})
 
-if __name__ == '__main__':
-    # Jalankan server Flask di port 5000
-    app.run(host='0.0.0.0', port=5000, debug=True)
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    if debug:
+        app.run(host="0.0.0.0", port=port, debug=True)
+    else:
+        from waitress import serve
+        print(f"[INFO] Menjalankan production WSGI server (Waitress) di 0.0.0.0:{port}")
+        serve(app, host="0.0.0.0", port=port, threads=8)

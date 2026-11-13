@@ -5,7 +5,7 @@
 
 @section('content')
 
-<link rel="preconnect" href="http://localhost:5000">
+<link rel="preconnect" href="{{ config('services.python_face.url') }}">
 
 <style>
     /* ===== LOADING SPINNER ===== */
@@ -122,7 +122,6 @@
         width: 100%;
         height: 100%;
         pointer-events: none;
-        transform: scaleX(-1);
     }
 
     /* Corner brackets */
@@ -538,7 +537,8 @@
                 <!-- Scan line -->
                 <div class="scan-line" id="scanLine"></div>
 
-                <img id="webcamFeed" style="width:100%;height:100%;object-fit:cover;display:none;" src="" alt="Webcam Feed">
+                <video id="webcamVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:none;transform:scaleX(-1);"></video>
+                <canvas id="overlayCanvas" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;display:none;z-index:5;"></canvas>
 
                 <!-- Loading spinner -->
                 <div class="camera-loading hidden" id="cameraLoading">
@@ -692,9 +692,12 @@
 <script>
     let isRunning = false;
     let scanCooldown = false;
-    let pollInterval = null;
+    let frameTimer = null;
+    let mediaStream = null;
+    let isUploadingFrame = false;
     let statHadir = 0, statGagal = 0, statTotal = 0;
-    const pythonHost = "http://localhost:5000";
+    const pythonHost = "{{ config('services.python_face.url') }}";
+    const sessionId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('sess_' + Date.now());
 
     const classStats = {
         kecil: {
@@ -784,7 +787,11 @@
         fetch(`${pythonHost}/`, { mode: 'cors' }).catch(() => {});
     });
 
-    const webcamFeed = document.getElementById('webcamFeed');
+    const webcamVideo = document.getElementById('webcamVideo');
+    const overlayCanvas = document.getElementById('overlayCanvas');
+    const overlayCtx = overlayCanvas.getContext('2d');
+    const captureCanvas = document.createElement('canvas');
+    const captureCtx = captureCanvas.getContext('2d');
     const cameraOff = document.getElementById('cameraOff');
     const statusBar = document.getElementById('statusBar');
     const statusText = document.getElementById('statusText');
@@ -795,61 +802,95 @@
         statusText.textContent = msg;
     }
 
-    function startCamera() {
+    function drawAttendanceOverlay(data) {
+        if (!webcamVideo.videoWidth || !webcamVideo.videoHeight) return;
+        if (overlayCanvas.width !== webcamVideo.videoWidth || overlayCanvas.height !== webcamVideo.videoHeight) {
+            overlayCanvas.width = webcamVideo.videoWidth;
+            overlayCanvas.height = webcamVideo.videoHeight;
+        }
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+        const modelColor = data.has_model ? '#10b981' : '#ef4444';
+        overlayCtx.font = 'bold 14px sans-serif';
+        overlayCtx.fillStyle = modelColor;
+        overlayCtx.fillText(data.has_model ? 'Model: OK' : 'Model: MISSING', 16, 26);
+
+        if (data.face_detected && data.box) {
+            const [x, y, w, h] = data.box;
+            let boxColor = '#ef4444';
+            if (!data.has_model) {
+                boxColor = '#f59e0b';
+            } else if (data.is_match) {
+                boxColor = '#10b981';
+            }
+            overlayCtx.strokeStyle = boxColor;
+            overlayCtx.lineWidth = 3;
+            overlayCtx.strokeRect(x, y, w, h);
+
+            if (data.label) {
+                overlayCtx.font = 'bold 15px sans-serif';
+                overlayCtx.fillStyle = boxColor;
+                overlayCtx.fillText(data.label, x, Math.max(20, y - 8));
+            }
+        }
+    }
+
+    async function startCamera() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            setStatus('error', 'Browser tidak mendukung akses kamera (pastikan menggunakan HTTPS atau localhost).');
+            return;
+        }
+
         try {
             setStatus('', 'Menghubungkan ke kamera...');
-            
             const loadingEl = document.getElementById('cameraLoading');
 
-            // Langsung tampilkan loading spinner (bukan blank hitam)
             cameraOff.style.display = 'none';
             loadingEl.classList.remove('hidden');
-            webcamFeed.style.display = 'none';
+            webcamVideo.style.display = 'none';
 
             document.getElementById('btnStart').disabled = true;
             document.getElementById('btnStop').disabled = false;
 
-            // Ketika frame pertama sudah dimuat, sembunyikan loading
-            webcamFeed.onload = function() {
-                loadingEl.classList.add('hidden');
-                webcamFeed.style.display = 'block';
-                scanLine.style.display = 'block';
-                setStatus('success', 'Kamera aktif — Mendeteksi wajah...');
-                webcamFeed.onload = null; // Hanya trigger sekali
-            };
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+                video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+                audio: false
+            });
 
-            webcamFeed.onerror = function() {
-                loadingEl.classList.add('hidden');
-                cameraOff.style.display = 'flex';
-                document.getElementById('btnStart').disabled = false;
-                document.getElementById('btnStop').disabled = true;
-                setStatus('error', 'Gagal menghubungkan ke kamera');
-            };
+            webcamVideo.srcObject = mediaStream;
+            await webcamVideo.play();
 
-            // Set source ke endpoint Flask absensi feed
-            webcamFeed.src = `${pythonHost}/attendance-feed`;
+            loadingEl.classList.add('hidden');
+            webcamVideo.style.display = 'block';
+            overlayCanvas.style.display = 'block';
+            scanLine.style.display = 'block';
+            setStatus('success', 'Kamera aktif — Mendeteksi wajah...');
+
             isRunning = true;
-
-            // Mulai polling hasil deteksi
-            startDetectionLoop();
-
+            sendAttendanceFrameLoop();
         } catch (err) {
+            stopCamera();
             setStatus('error', 'Gagal mengakses kamera: ' + err.message);
         }
     }
 
     function stopCamera() {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-            pollInterval = null;
+        if (frameTimer) {
+            clearTimeout(frameTimer);
+            frameTimer = null;
         }
-        
-        webcamFeed.src = "";
-        webcamFeed.style.display = 'none';
-        webcamFeed.onload = null;
-        webcamFeed.onerror = null;
-        
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(track => track.stop());
+            mediaStream = null;
+        }
+
+        webcamVideo.srcObject = null;
+        webcamVideo.style.display = 'none';
+        overlayCanvas.style.display = 'none';
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
         isRunning = false;
+        isUploadingFrame = false;
         document.getElementById('cameraLoading').classList.add('hidden');
         cameraOff.style.display = 'flex';
         scanLine.style.display = 'none';
@@ -860,24 +901,54 @@
         setStatus('idle', 'Kamera dimatikan');
     }
 
-    function startDetectionLoop() {
-        if (pollInterval) clearInterval(pollInterval);
-        
-        pollInterval = setInterval(() => {
-            if (!isRunning || scanCooldown) return;
+    function sendAttendanceFrameLoop() {
+        if (!isRunning || !mediaStream) return;
 
-            fetch(`${pythonHost}/attendance-status`)
-                .then(res => res.json())
-                .then(data => {
-                    if (data.user_id && !scanCooldown) {
-                        // Wajah terdeteksi! Jalankan proses absensi
+        if (!scanCooldown && !isUploadingFrame && webcamVideo.readyState >= 2 && webcamVideo.videoWidth > 0) {
+            isUploadingFrame = true;
+            captureCanvas.width = webcamVideo.videoWidth;
+            captureCanvas.height = webcamVideo.videoHeight;
+
+            captureCtx.save();
+            captureCtx.translate(captureCanvas.width, 0);
+            captureCtx.scale(-1, 1);
+            captureCtx.drawImage(webcamVideo, 0, 0, captureCanvas.width, captureCanvas.height);
+            captureCtx.restore();
+
+            captureCanvas.toBlob(async (blob) => {
+                if (!blob || !isRunning || !mediaStream) {
+                    isUploadingFrame = false;
+                    return;
+                }
+
+                try {
+                    const formData = new FormData();
+                    formData.append('image', blob, 'frame.jpg');
+                    formData.append('session_id', sessionId);
+
+                    const res = await fetch(`${pythonHost}/api/attendance-frame`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const data = await res.json();
+                    drawAttendanceOverlay(data);
+
+                    if (data.recognized && data.user_id && !scanCooldown) {
                         onFaceRecognized({ id: data.user_id });
                     }
-                })
-                .catch(err => {
-                    console.error("Error polling attendance status:", err);
-                });
-        }, 500);
+                } catch (err) {
+                    console.error("Error sending attendance frame:", err);
+                } finally {
+                    isUploadingFrame = false;
+                    if (isRunning) {
+                        frameTimer = setTimeout(sendAttendanceFrameLoop, 150);
+                    }
+                }
+            }, 'image/jpeg', 0.8);
+            return;
+        }
+
+        frameTimer = setTimeout(sendAttendanceFrameLoop, 150);
     }
 
     function onFaceRecognized(userData) {
@@ -965,7 +1036,11 @@
         .finally(() => {
             setTimeout(() => {
                 // Beri tahu Python untuk melepas kunci recognition agar wajah berikutnya bisa dideteksi
-                fetch(`${pythonHost}/attendance-unlock`, { method: 'POST' })
+                fetch(`${pythonHost}/attendance-unlock`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId })
+                })
                     .catch(err => console.warn('Gagal unlock attendance:', err));
 
                 scanCooldown = false;
