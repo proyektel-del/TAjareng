@@ -4,20 +4,14 @@
 FROM node:22-alpine AS node-builder
 WORKDIR /app
 
-# Copy dependency files
 COPY package*.json ./
 COPY .npmrc* ./
-
-# Install packages with npm install (more tolerant on platform differences than npm ci)
 RUN npm install --ignore-scripts
 
-# Copy source files needed for Vite
 COPY resources ./resources
 COPY vite.config.js ./
 COPY tailwind.config.js ./
 COPY postcss.config.js* ./
-
-# Build assets
 RUN npm run build
 
 # ==========================================
@@ -64,6 +58,8 @@ RUN { \
     echo 'upload_max_filesize=32M'; \
     echo 'post_max_size=32M'; \
     echo 'max_execution_time=60'; \
+    echo 'catch_workers_output=yes'; \
+    echo 'decorate_workers_output=no'; \
 } > /usr/local/etc/php/conf.d/custom-php.ini
 
 # Install Composer
@@ -88,7 +84,8 @@ RUN chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache \
 COPY docker/nginx.conf /etc/nginx/http.d/default.conf
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN dos2unix /usr/local/bin/entrypoint.sh 2>/dev/null || sed -i -e 's/\r$//' /usr/local/bin/entrypoint.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 80
 
