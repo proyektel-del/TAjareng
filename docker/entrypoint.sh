@@ -50,15 +50,23 @@ server {
 }
 EOF
 
-# Pastikan permission folder storage dan bootstrap/cache aman
-chmod -R 775 /var/www/storage /var/www/bootstrap/cache || true
-chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache || true
+# Pastikan folder penting ada dan writable
+mkdir -p /var/www/storage/framework/sessions /var/www/storage/framework/views /var/www/storage/framework/cache /var/www/storage/logs
+chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache
+chmod -R 775 /var/www/storage /var/www/bootstrap/cache
+
+# Jika APP_KEY belum diset di environment, generate sementara agar tidak crash 500
+if [ -z "$APP_KEY" ]; then
+    echo "[WARN] APP_KEY is empty. Generating application key..."
+    php artisan key:generate --force || true
+fi
 
 # Storage link & database migrate
 php artisan storage:link || true
 php artisan migrate --force || true
 
-# Caching Laravel
+# Bersihkan cache lama lalu buat cache baru yang valid
+php artisan optimize:clear || true
 php artisan config:cache || true
 php artisan route:cache || true
 php artisan view:cache || true
