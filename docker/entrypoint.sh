@@ -12,8 +12,9 @@ server {
     root /var/www/public;
     index index.php index.html;
 
-    client_max_body_size 32M;
+    client_max_body_size 16M;
 
+    # Gzip Compression hemat bandwidth
     gzip on;
     gzip_vary on;
     gzip_min_length 1024;
@@ -24,9 +25,11 @@ server {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
+    # Static assets cache lama (1 tahun) & matikan access log agar hemat I/O CPU
     location ~* \.(?:css(\.map)?|js(\.map)?|jpe?g|png|gif|ico|cur|heic|webp|tiff?|mp3|m4a|aac|ogg|midi?|wav|mp4|mov|webm|mpe?g|avi|ogv|flv|wmv|svgz?|ttf|ttc|otf|eot|woff2?)$ {
         expires 1y;
         access_log off;
+        log_not_found off;
         add_header Cache-Control "public, immutable";
         try_files \$uri =404;
     }

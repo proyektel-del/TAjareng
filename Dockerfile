@@ -43,23 +43,22 @@ RUN apk add --no-cache \
 # OPcache settings for high performance and low CPU
 RUN { \
     echo 'opcache.enable=1'; \
-    echo 'opcache.memory_consumption=128'; \
+    echo 'opcache.memory_consumption=64'; \
     echo 'opcache.interned_strings_buffer=8'; \
-    echo 'opcache.max_accelerated_files=10000'; \
+    echo 'opcache.max_accelerated_files=5000'; \
     echo 'opcache.revalidate_freq=0'; \
     echo 'opcache.validate_timestamps=0'; \
     echo 'opcache.save_comments=1'; \
     echo 'opcache.fast_shutdown=1'; \
 } > /usr/local/etc/php/conf.d/opcache-recommended.ini
 
-# PHP memory & upload tuning
+# PHP memory & upload tuning (hemat resource RAM)
 RUN { \
-    echo 'memory_limit=256M'; \
-    echo 'upload_max_filesize=32M'; \
-    echo 'post_max_size=32M'; \
-    echo 'max_execution_time=60'; \
-    echo 'catch_workers_output=yes'; \
-    echo 'decorate_workers_output=no'; \
+    echo 'memory_limit=128M'; \
+    echo 'upload_max_filesize=16M'; \
+    echo 'post_max_size=16M'; \
+    echo 'max_execution_time=30'; \
+    echo 'expose_php=off'; \
 } > /usr/local/etc/php/conf.d/custom-php.ini
 
 # Install Composer
@@ -80,13 +79,13 @@ RUN composer install --no-dev --optimize-autoloader --no-interaction --prefer-di
 RUN chown -R www-data:www-data /var/www/storage /var/www/bootstrap/cache \
     && chmod -R 775 /var/www/storage /var/www/bootstrap/cache
 
-# Copy Nginx, Supervisor, and entrypoint
+# Copy Nginx, PHP-FPM pool tuning, Supervisor, and entrypoint
 COPY docker/nginx.conf /etc/nginx/http.d/default.conf
+COPY docker/zz-docker.conf /usr/local/etc/php-fpm.d/zz-docker.conf
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Expose port 80 (Nginx web server)
 EXPOSE 80
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
