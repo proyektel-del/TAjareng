@@ -31,7 +31,8 @@ model_lock = threading.Lock()
 # Load Haar Cascade sekali saat startup agar cepat
 FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
-clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+# CLAHE adaptif dengan clipLimit 3.0 untuk menstabilkan kondisi cahaya backlight / berlebih
+clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
 # Recognizer global untuk attendance
 recognizer = None
@@ -98,7 +99,9 @@ def preprocess_face(gray, x, y, w, h, apply_clahe=False):
     face_crop = gray[y_cropped : y_cropped + h_cropped, x : x + w]
     face_resized = cv2.resize(face_crop, (200, 200))
     if apply_clahe:
+        # Gunakan kombinasi CLAHE + normalisasi min-max agar tahan silau / cahaya berlebih
         face_resized = clahe.apply(face_resized)
+        face_resized = cv2.normalize(face_resized, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
     return face_resized
 
 
@@ -241,8 +244,8 @@ def manual_train():
 # ABSENSI SCAN WAJAH (RECOGNITION)
 # ==========================================
 REQUIRED_VOTES = 1
-MAX_AVG_CONFIDENCE = 48.0
-MAX_FRAME_CONFIDENCE = 48.0
+MAX_AVG_CONFIDENCE = 55.0
+MAX_FRAME_CONFIDENCE = 55.0
 
 attendance_sessions = {}
 attendance_lock = threading.Lock()
@@ -267,12 +270,26 @@ def attendance_frame():
     session_id = request.form.get("session_id") or (request.get_json(silent=True) or {}).get("session_id") or "default"
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Deteksi multi-scale dengan equalized image jika silau/cahaya redup
     faces = face_cascade.detectMultiScale(
         gray,
-        scaleFactor=1.3,
-        minNeighbors=5,
-        minSize=(150, 150),
+        scaleFactor=1.2,
+        minNeighbors=4,
+        minSize=(120, 120),
     )
+    
+    # Jika wajah belum terdeteksi karena silau/overexposed, coba deteksi dengan CLAHE
+    if len(faces) == 0:
+        gray_enhanced = clahe.apply(gray)
+        faces = face_cascade.detectMultiScale(
+            gray_enhanced,
+            scaleFactor=1.2,
+            minNeighbors=4,
+            minSize=(120, 120),
+        )
+        if len(faces) > 0:
+            gray = gray_enhanced
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
 
     if len(faces) == 0:
