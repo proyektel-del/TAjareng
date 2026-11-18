@@ -828,9 +828,11 @@
             overlayCtx.strokeRect(x, y, w, h);
 
             if (data.label) {
+                // Sembunyikan counter angka voting jika sudah instan 1/1 agar rapi
+                const cleanLabel = data.label.replace(/\s*\[\d+\/\d+\]/, '');
                 overlayCtx.font = 'bold 15px sans-serif';
                 overlayCtx.fillStyle = boxColor;
-                overlayCtx.fillText(data.label, x, Math.max(20, y - 8));
+                overlayCtx.fillText(cleanLabel, x, Math.max(20, y - 8));
             }
         }
     }
@@ -1047,7 +1049,7 @@
                 if (isRunning) {
                     setStatus('success', 'Kamera aktif — Mendeteksi wajah...');
                 }
-            }, 2000); // Cooldown 2 detik agar tidak terus menerus mendeteksi orang yang sama
+            }, 800); // Cooldown dipersingkat ke 800ms (kurang dari 1 detik) agar cepat siap untuk scan berikutnya
         });
     }
 
