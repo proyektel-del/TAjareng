@@ -908,8 +908,11 @@
 
         if (!scanCooldown && !isUploadingFrame && webcamVideo.readyState >= 2 && webcamVideo.videoWidth > 0) {
             isUploadingFrame = true;
-            captureCanvas.width = webcamVideo.videoWidth;
-            captureCanvas.height = webcamVideo.videoHeight;
+            // Kirim frame resolusi optimal (400px) agar upload super cepat & deteksi instan
+            const targetWidth = 400;
+            const targetHeight = Math.round((webcamVideo.videoHeight / webcamVideo.videoWidth) * targetWidth);
+            captureCanvas.width = targetWidth;
+            captureCanvas.height = targetHeight;
 
             captureCtx.save();
             captureCtx.translate(captureCanvas.width, 0);
@@ -933,6 +936,18 @@
                         body: formData
                     });
                     const data = await res.json();
+                    
+                    // Skala kembali koordinat bounding box ke resolusi video asli agar presisi
+                    if (data.box && webcamVideo.videoWidth) {
+                        const scaleFactor = webcamVideo.videoWidth / targetWidth;
+                        data.box = [
+                            Math.round(data.box[0] * scaleFactor),
+                            Math.round(data.box[1] * scaleFactor),
+                            Math.round(data.box[2] * scaleFactor),
+                            Math.round(data.box[3] * scaleFactor)
+                        ];
+                    }
+                    
                     drawAttendanceOverlay(data);
 
                     if (data.recognized && data.user_id && !scanCooldown) {
@@ -943,14 +958,14 @@
                 } finally {
                     isUploadingFrame = false;
                     if (isRunning) {
-                        frameTimer = setTimeout(sendAttendanceFrameLoop, 120);
+                        frameTimer = setTimeout(sendAttendanceFrameLoop, 50);
                     }
                 }
-            }, 'image/jpeg', 0.7);
+            }, 'image/jpeg', 0.65);
             return;
         }
 
-        frameTimer = setTimeout(sendAttendanceFrameLoop, 120);
+        frameTimer = setTimeout(sendAttendanceFrameLoop, 50);
     }
 
     function onFaceRecognized(userData) {

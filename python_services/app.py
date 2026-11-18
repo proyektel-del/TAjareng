@@ -288,12 +288,12 @@ def attendance_frame():
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     
-    # Deteksi multi-scale dengan equalized image jika silau/cahaya redup
+    # Deteksi multi-scale cepat dengan minSize 80
     faces = face_cascade.detectMultiScale(
         gray,
         scaleFactor=1.2,
-        minNeighbors=4,
-        minSize=(120, 120),
+        minNeighbors=3,
+        minSize=(80, 80),
     )
     
     # Jika wajah belum terdeteksi karena silau/overexposed, coba deteksi dengan CLAHE
