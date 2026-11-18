@@ -240,9 +240,9 @@ def manual_train():
 # ==========================================
 # ABSENSI SCAN WAJAH (RECOGNITION)
 # ==========================================
-REQUIRED_VOTES = 7
-MAX_AVG_CONFIDENCE = 40.0
-MAX_FRAME_CONFIDENCE = 45.0
+REQUIRED_VOTES = 1
+MAX_AVG_CONFIDENCE = 48.0
+MAX_FRAME_CONFIDENCE = 48.0
 
 attendance_sessions = {}
 attendance_lock = threading.Lock()
