@@ -673,7 +673,7 @@
 
                     const status = data.status;
                     const current = data.current || 0;
-                    const total = data.total || 100;
+                    const total = data.total || 50;
                     const percent = Math.round((current / total) * 100);
 
                     progressBar.style.width = percent + "%";
@@ -745,7 +745,7 @@
                 .then(data => {
                     const status = data.status;
                     const current = data.current || 0;
-                    const total = data.total || 100;
+                    const total = data.total || 50;
                     const percent = Math.round((current / total) * 100);
 
                     progressBar.style.width = percent + "%";

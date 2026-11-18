@@ -23,7 +23,7 @@ cors_origins = "*" if cors_origins_raw == "*" else [o.strip() for o in cors_orig
 CORS(app, resources={r"/*": {"origins": cors_origins}})
 
 # Global status tracker untuk proses registrasi
-# Format: { user_id: { 'status': 'idle'|'capturing'|'training'|'completed'|'failed', 'current': 0, 'total': 100, 'message': '' } }
+# Format: { user_id: { 'status': 'idle'|'capturing'|'training'|'completed'|'failed', 'current': 0, 'total': 50, 'message': '' } }
 captures_status = {}
 status_lock = threading.Lock()
 model_lock = threading.Lock()
@@ -138,7 +138,7 @@ def index():
 
 @app.route("/api/register-frame/<int:user_id>", methods=["POST"])
 def register_frame(user_id):
-    total_samples = 100
+    total_samples = 50
     frame = decode_uploaded_frame()
     if frame is None:
         return jsonify({"success": False, "message": "Frame gambar tidak valid."}), 400
@@ -230,7 +230,7 @@ def get_status(user_id):
             {
                 "status": "idle",
                 "current": 0,
-                "total": 100,
+                "total": 50,
                 "message": "Belum memulai.",
             },
         )
@@ -243,7 +243,7 @@ def reset_status(user_id):
         captures_status[user_id] = {
             "status": "idle",
             "current": 0,
-            "total": 100,
+            "total": 50,
             "message": "State direset.",
         }
     return jsonify({"success": True, "message": f"Status untuk user {user_id} telah direset"})
