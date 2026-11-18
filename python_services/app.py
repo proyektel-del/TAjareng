@@ -161,12 +161,28 @@ def register_frame(user_id):
             return jsonify({**current_state, "face_detected": False, "box": None})
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Deteksi multi-scale pada frame standar
     faces = face_cascade.detectMultiScale(
         gray,
-        scaleFactor=1.3,
-        minNeighbors=5,
-        minSize=(120, 120),
+        scaleFactor=1.2,
+        minNeighbors=4,
+        minSize=(100, 100),
     )
+    
+    # Jika wajah belum terdeteksi (karena silau, backlight, atau cahaya berlebih),
+    # coba gunakan CLAHE enhancement agar fitur wajah (mata, alis, bibir) tetap terlihat
+    if len(faces) == 0:
+        gray_enhanced = clahe.apply(gray)
+        faces = face_cascade.detectMultiScale(
+            gray_enhanced,
+            scaleFactor=1.2,
+            minNeighbors=4,
+            minSize=(100, 100),
+        )
+        if len(faces) > 0:
+            gray = gray_enhanced
+
     faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
 
     face_detected = len(faces) > 0
@@ -175,7 +191,8 @@ def register_frame(user_id):
     if face_detected:
         x, y, w, h = [int(v) for v in faces[0]]
         box = [x, y, w, h]
-        face_resized = preprocess_face(gray, x, y, w, h, apply_clahe=False)
+        # Gunakan normalisasi cahaya (apply_clahe=True) agar dataset yang tersimpan tahan silau
+        face_resized = preprocess_face(gray, x, y, w, h, apply_clahe=True)
 
         should_train = False
         with status_lock:
